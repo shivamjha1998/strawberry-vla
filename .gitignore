@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Models (large binary files — don't commit)
+*.pt
+*.bin
+*.safetensors
+*.gguf
+
+# Downloaded videos and extracted frames (regenerable)
+videos/
+frames/
+
+# Detection outputs (regenerable)
+outputs/
+
+# HuggingFace model cache
+.cache/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Temp files
+*.tmp
+*.log

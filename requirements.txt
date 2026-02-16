@@ -1,0 +1,17 @@
+# MLX-VLM (Qwen 2.5 VL on Apple Silicon)
+mlx-vlm
+
+# YOLO (object detection)
+ultralytics
+
+# Video processing & utilities
+opencv-python-headless
+yt-dlp
+pillow
+numpy
+
+# Demo UI
+gradio
+
+# Jupyter
+jupyter
