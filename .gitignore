@@ -19,6 +19,12 @@ frames/
 # Detection outputs (regenerable)
 outputs/
 
+# Downloaded datasets (regenerable)
+datasets/
+
+# Runs (regenerable) 
+runs/
+
 # HuggingFace model cache
 .cache/
 
