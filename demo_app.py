@@ -11,8 +11,10 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,6 +38,15 @@ qwen_detector = None
 TEMP_DIR = tempfile.mkdtemp(prefix="strawberry_demo_")
 os.makedirs(os.path.join(TEMP_DIR, "frames"), exist_ok=True)
 os.makedirs(os.path.join(TEMP_DIR, "outputs"), exist_ok=True)
+
+
+def _cleanup_temp():
+    """Remove all temp files (videos, frames, uploads) on exit."""
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)
+
+
+atexit.register(_cleanup_temp)
 
 
 def get_yolo():
@@ -76,7 +87,17 @@ load_locales()
 
 # ─── YouTube Processing ──────────────────────────────────────────────────────
 
+_DOWNLOAD_TIMEOUT = 300  # seconds — match video_ingest.py
+
+_YT_URL_RE = re.compile(
+    r'^https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w\-]+',
+)
+
+
 def download_youtube_video(url: str, max_duration: int = 120) -> str:
+    if not _YT_URL_RE.match(url):
+        raise ValueError("Invalid YouTube URL format.")
+
     output_path = os.path.join(TEMP_DIR, "video.mp4")
     if os.path.exists(output_path):
         os.remove(output_path)
@@ -86,7 +107,7 @@ def download_youtube_video(url: str, max_duration: int = 120) -> str:
         "--download-sections", f"*0-{max_duration}",
         "-o", output_path, "--no-playlist", "--quiet", url
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_DOWNLOAD_TIMEOUT)
     if result.returncode != 0:
         raise RuntimeError(f"Download failed: {result.stderr[:200]}")
 
@@ -319,7 +340,8 @@ def handle_youtube(url, num_frames, do_disease, do_detailed, lang, progress=gr.P
             json.dumps({"frames": all_json}, indent=2),
         )
     except Exception as e:
-        return [], f"{t('error_prefix', lang)}: {str(e)}", "{}"
+        print(f"[YouTube error] {e}")
+        return [], f"{t('error_prefix', lang)}: Could not process the video. Check the URL and try again.", "{}"
 
 
 def handle_image_upload(image, do_disease, do_detailed, lang):
@@ -352,7 +374,8 @@ def handle_image_upload(image, do_disease, do_detailed, lang):
             annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
         return annotated, text, json.dumps(json_data, indent=2)
     except Exception as e:
-        return None, f"{t('error_prefix', lang)}: {str(e)}", "{}"
+        print(f"[Image error] {e}")
+        return None, f"{t('error_prefix', lang)}: Could not process the image. Please try a different file.", "{}"
 
 
 # ─── Tab helpers (custom buttons instead of gr.Tabs for dynamic labels) ──────
@@ -1050,7 +1073,7 @@ def main():
     demo = build_demo()
     favicon = Path(__file__).parent / "favicon.png"
     demo.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=args.port,
         share=args.share,
         show_error=True,

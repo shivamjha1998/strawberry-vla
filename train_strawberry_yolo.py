@@ -22,8 +22,8 @@ Usage:
 
 import argparse
 import os
+import subprocess
 import sys
-import json
 import shutil
 from pathlib import Path
 
@@ -40,7 +40,7 @@ TRAIN_CONFIG = {
     "epochs": 80,                 # Good balance for fine-tuning
     "batch": 16,                  # Safe for 16GB RAM with nano model
     "imgsz": 640,                 # Standard YOLO input size
-    "device": "mps",              # Apple Silicon GPU
+    "device": None,               # Auto-detect (set in train())
     "workers": 4,                 # M4 has efficient cores
     "patience": 20,               # Early stopping if no improvement
     "save_period": 10,            # Save checkpoint every 10 epochs
@@ -101,7 +101,10 @@ def download_dataset(api_key: str, dataset_name: str = DEFAULT_DATASET):
         from roboflow import Roboflow
     except ImportError:
         print("Installing roboflow...")
-        os.system(f"{sys.executable} -m pip install roboflow --break-system-packages -q")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "roboflow", "-q"],
+            check=True,
+        )
         from roboflow import Roboflow
 
     ds_info = DATASETS[dataset_name]
@@ -192,16 +195,21 @@ def train(data_yaml_path: str = None):
     print(f"  Dataset:  {data_yaml_path}")
     print(f"{'='*60}\n")
 
-    # Check MPS availability
+    # Auto-detect best device
     try:
         import torch
-        if not torch.backends.mps.is_available():
-            print("⚠️  MPS not available, falling back to CPU")
-            TRAIN_CONFIG["device"] = "cpu"
-        else:
+        if torch.backends.mps.is_available():
+            TRAIN_CONFIG["device"] = "mps"
             print("✅ MPS (Apple Silicon GPU) available")
+        elif torch.cuda.is_available():
+            TRAIN_CONFIG["device"] = "cuda"
+            print("✅ CUDA GPU available")
+        else:
+            TRAIN_CONFIG["device"] = "cpu"
+            print("⚠️  No GPU found, using CPU")
     except Exception:
-        print("⚠️  Could not check MPS, trying anyway...")
+        TRAIN_CONFIG["device"] = "cpu"
+        print("⚠️  Could not detect GPU, using CPU")
 
     # Load pre-trained model
     model = YOLO(TRAIN_CONFIG["model"])
@@ -255,7 +263,12 @@ def test_model(weights_path: str = None):
 
     # Validation metrics
     data_yaml = fix_data_yaml()
-    metrics = model.val(data=data_yaml, device="mps")
+    try:
+        import torch
+        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        device = "cpu"
+    metrics = model.val(data=data_yaml, device=device)
 
     print(f"\n{'='*60}")
     print(f"Validation Results:")
@@ -290,7 +303,12 @@ def quick_inference(image_path: str, weights_path: str = None):
             weights_path = str(BEST_WEIGHTS)
 
     model = YOLO(weights_path)
-    results = model(image_path, conf=0.25, device="mps")
+    try:
+        import torch
+        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        device = "cpu"
+    results = model(image_path, conf=0.25, device=device)
 
     for r in results:
         print(f"\nDetections in {image_path}:")

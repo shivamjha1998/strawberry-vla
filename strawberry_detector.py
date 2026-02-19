@@ -32,7 +32,6 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -101,6 +100,19 @@ Provide a detailed ripeness assessment. Output ONLY JSON:
 
 # ─── YOLO11 Detector (PRIMARY) ───────────────────────────────────────────────
 
+def _get_device():
+    """Return the best available accelerator: mps > cuda > cpu."""
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class YOLODetector:
     """YOLO11 strawberry detector — trained on harvesting robot dataset."""
 
@@ -126,7 +138,7 @@ class YOLODetector:
 
     def detect(self, image_path: str, conf_threshold: float = 0.3) -> list:
         self.load()
-        results = self.model(image_path, verbose=False, conf=conf_threshold, device="mps")
+        results = self.model(image_path, verbose=False, conf=conf_threshold, device=_get_device())
 
         detections = []
         for r in results:

@@ -16,5 +16,8 @@ gradio
 # Jupyter
 jupyter
 
+# YAML parsing (used by training script)
+pyyaml
+
 # Roboflow
 roboflow
