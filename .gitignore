@@ -39,3 +39,8 @@ runs/
 # Temp files
 *.tmp
 *.log
+
+# Roboflow files (regenerable)
+model_artifacts.json
+roboflow_deploy.zip
+upload_model.py
