@@ -18,6 +18,7 @@ frames/
 
 # Detection outputs (regenerable)
 outputs/
+output/
 
 # Downloaded datasets (regenerable)
 datasets/
@@ -44,3 +45,10 @@ runs/
 model_artifacts.json
 roboflow_deploy.zip
 upload_model.py
+
+# QA Pipeline outputs (regenerable)
+qa_pipeline/
+
+# results
+comparison_results/
+temp/

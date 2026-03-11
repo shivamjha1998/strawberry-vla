@@ -179,10 +179,15 @@ class YOLODetector:
 # ─── Qwen VL Detector (SECONDARY — analysis) ─────────────────────────────────
 
 class QwenVLDetector:
-    """Qwen 2.5 VL — now used for detailed crop analysis & disease detection."""
+    """Qwen 3 VL — used for detailed crop analysis & disease detection.
 
-    def __init__(self, model_path="mlx-community/Qwen2.5-VL-7B-Instruct-4bit"):
+    Supports optional LoRA adapter for fine-tuned strawberry analysis.
+    """
+
+    def __init__(self, model_path="mlx-community/Qwen3-VL-8B-Instruct-4bit",
+                 adapter_path=None):
         self.model_path = model_path
+        self.adapter_path = adapter_path
         self.model = None
         self.processor = None
         self.config = None
@@ -190,16 +195,20 @@ class QwenVLDetector:
     def load(self):
         if self.model is not None:
             return
-        print(f"  Loading Qwen 2.5 VL ({self.model_path})...")
+        label = "Qwen 3 VL + LoRA" if self.adapter_path else "Qwen 3 VL"
+        print(f"  Loading {label} ({self.model_path})...")
+        if self.adapter_path:
+            print(f"  Adapter: {self.adapter_path}")
         load_start = time.time()
         from mlx_vlm import load, generate
         from mlx_vlm.prompt_utils import apply_chat_template
         from mlx_vlm.utils import load_config
-        self.model, self.processor = load(self.model_path)
+        self.model, self.processor = load(self.model_path,
+                                          adapter_path=self.adapter_path)
         self.config = load_config(self.model_path)
         self._generate = generate
         self._apply_chat_template = apply_chat_template
-        print(f"  ✓ Model loaded in {time.time() - load_start:.1f}s")
+        print(f"  ✓ {label} loaded in {time.time() - load_start:.1f}s")
 
     def unload(self):
         if self.model is not None:
@@ -536,7 +545,9 @@ def main():
     parser.add_argument("--conf", type=float, default=0.3, help="YOLO confidence threshold")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--yolo-model", type=str, default="strawberry_yolo_best.pt")
-    parser.add_argument("--qwen-model", type=str, default="mlx-community/Qwen2.5-VL-7B-Instruct-4bit")
+    parser.add_argument("--qwen-model", type=str, default="mlx-community/Qwen3-VL-8B-Instruct-4bit")
+    parser.add_argument("--adapter-path", type=str, default=None,
+                        help="Path to MLX LoRA adapter directory")
     args = parser.parse_args()
 
     if not args.image and not args.frames and not args.frames_root:
@@ -552,7 +563,7 @@ def main():
 
     yolo = YOLODetector(args.yolo_model)
     needs_qwen = args.detailed or args.disease or args.legacy
-    qwen = QwenVLDetector(args.qwen_model) if needs_qwen else None
+    qwen = QwenVLDetector(args.qwen_model, adapter_path=args.adapter_path) if needs_qwen else None
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.image:

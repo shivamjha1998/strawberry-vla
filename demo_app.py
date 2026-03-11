@@ -60,7 +60,9 @@ def get_yolo():
 def get_qwen():
     global qwen_detector
     if qwen_detector is None:
-        qwen_detector = QwenVLDetector()
+        qwen_detector = QwenVLDetector(
+            adapter_path="output/v2-20260308-003328/checkpoint-861-mlx"
+        )
         qwen_detector.load()
     return qwen_detector
 
@@ -1066,7 +1068,7 @@ def main():
         print("\nLoading YOLO11...")
         get_yolo()
         print("  Ready")
-        print("\nLoading Qwen 2.5 VL...")
+        print("\nLoading Qwen 3 VL (fine-tuned)...")
         get_qwen()
         print("  Ready")
 
