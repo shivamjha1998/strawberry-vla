@@ -32,9 +32,26 @@ from strawberry_detector import (
     visualize_detections,
 )
 
+try:
+    from stereo_calibration import (
+        CameraCalibrator,
+        StereoCalibrator,
+        StereoDepthEstimator,
+        MonocularDepthEstimator,
+        generate_synthetic_calibration,
+        generate_synthetic_stereo_pair,
+        draw_depth_overlay,
+        draw_epipolar_lines,
+    )
+    HAS_STEREO = True
+except ImportError:
+    HAS_STEREO = False
+
 # ─── Global State ─────────────────────────────────────────────────────────────
 yolo_detector = None
 qwen_detector = None
+stereo_calibrator = None
+depth_estimator = None
 TEMP_DIR = tempfile.mkdtemp(prefix="strawberry_demo_")
 os.makedirs(os.path.join(TEMP_DIR, "frames"), exist_ok=True)
 os.makedirs(os.path.join(TEMP_DIR, "outputs"), exist_ok=True)
@@ -158,7 +175,7 @@ def extract_sample_frames(video_path: str, num_frames: int = 8) -> list:
 
 # ─── Detection Logic ──────────────────────────────────────────────────────────
 
-def detect_single_image(image_path, do_disease=False, do_detailed=False):
+def detect_single_image(image_path, do_disease=False, do_detailed=False, do_3d=False):
     yolo = get_yolo()
 
     t0 = time.time()
@@ -173,6 +190,15 @@ def detect_single_image(image_path, do_disease=False, do_detailed=False):
             rgb_analyses.append(
                 analyze_rgb_ripeness(img, bbox) if len(bbox) == 4 else {}
             )
+
+    # Monocular 3D estimation (adds position_3d to each detection)
+    mono_time = 0
+    if do_3d and HAS_STEREO and detections and img is not None:
+        h, w = img.shape[:2]
+        mono = MonocularDepthEstimator(image_size=(w, h))
+        t0_m = time.time()
+        mono.compute_full_3d(detections)
+        mono_time = time.time() - t0_m
 
     qwen_analyses = []
     if do_detailed and detections:
@@ -211,19 +237,22 @@ def detect_single_image(image_path, do_disease=False, do_detailed=False):
         TEMP_DIR, "outputs", f"annotated_{Path(image_path).name}"
     )
     if detections:
-        visualize_detections(image_path, detections, annotated_path, rgb_analyses)
+        visualize_detections(image_path, detections, annotated_path, rgb_analyses,
+                             show_3d=do_3d)
     else:
         shutil.copy2(image_path, annotated_path)
 
-    return annotated_path, detections, rgb_analyses, qwen_analyses, disease_result, det_time
+    return annotated_path, detections, rgb_analyses, qwen_analyses, disease_result, det_time, mono_time
 
 
-def build_results_text(detections, rgb_analyses, qwen_analyses, disease_result, det_time, lang="en"):
+def build_results_text(detections, rgb_analyses, qwen_analyses, disease_result, det_time, lang="en", mono_time=0):
     lines = []
     lines.append(f"### {t('detection_results', lang)}")
+    timing = f"YOLO11: {det_time * 1000:.1f}ms"
+    if mono_time > 0:
+        timing += f" | 3D: {mono_time * 1000:.1f}ms"
     lines.append(
-        f"**{t('strawberries_found', lang)}: {len(detections)}** — "
-        f"YOLO11: {det_time * 1000:.1f}ms\n"
+        f"**{t('strawberries_found', lang)}: {len(detections)}** — {timing}\n"
     )
 
     if not detections:
@@ -252,6 +281,18 @@ def build_results_text(detections, rgb_analyses, qwen_analyses, disease_result, 
                 f"{t('ripe_pct', lang)}={rgb.get('ripeness_percentage', '?')}% | "
                 f"{t('red_pct', lang)}={rgb.get('red_pixel_pct', '?')}% | "
                 f"{t('harvest_ready', lang)}: {harvest}"
+            )
+
+        pos = det.get("position_3d")
+        if pos:
+            c = pos["center_3d"]
+            lines.append(
+                f"- **{t('depth_label', lang)}**: {pos['depth_mm'] / 10:.1f} {t('unit_cm', lang)} | "
+                f"**{t('confidence_3d', lang)}**: {pos['confidence']}"
+            )
+            lines.append(
+                f"- **{t('position_3d_label', lang)}**: "
+                f"X={c['x_mm']:.1f}, Y={c['y_mm']:.1f}, Z={c['z_mm']:.1f} {t('unit_mm', lang)}"
             )
 
         if i < len(qwen_analyses) and qwen_analyses[i] and "error" not in qwen_analyses[i]:
@@ -290,13 +331,16 @@ def build_about_md(lang="en"):
         f"---\n\n"
         f"### {t('about_models', lang)}\n\n"
         f"- {t('model_yolo', lang)}\n"
-        f"- {t('model_qwen', lang)}"
+        f"- {t('model_qwen', lang)}\n\n"
+        f"---\n\n"
+        f"### {t('about_stereo', lang)}\n\n"
+        f"{t('about_stereo_text', lang)}"
     )
 
 
 # ─── Gradio Handlers ─────────────────────────────────────────────────────────
 
-def handle_youtube(url, num_frames, do_disease, do_detailed, lang, progress=gr.Progress()):
+def handle_youtube(url, num_frames, do_disease, do_detailed, do_3d, lang, progress=gr.Progress()):
     if not url or not url.strip():
         return [], t("enter_url", lang), "{}"
     try:
@@ -313,11 +357,11 @@ def handle_youtube(url, num_frames, do_disease, do_detailed, lang, progress=gr.P
                 0.2 + 0.7 * (i / len(frame_paths)),
                 desc=f"Frame {i + 1}/{len(frame_paths)}...",
             )
-            ann_path, dets, rgb, qwen, disease, dt = detect_single_image(
-                fp, do_disease=do_disease, do_detailed=do_detailed
+            ann_path, dets, rgb, qwen, disease, dt, mt = detect_single_image(
+                fp, do_disease=do_disease, do_detailed=do_detailed, do_3d=do_3d,
             )
             all_annotated.append(ann_path)
-            text = build_results_text(dets, rgb, qwen, disease, dt, lang)
+            text = build_results_text(dets, rgb, qwen, disease, dt, lang, mono_time=mt)
             all_text.append(
                 f"---\n**Frame {i + 1}** "
                 f"(t={Path(fp).stem.split('_t')[-1]})\n\n{text}"
@@ -346,7 +390,7 @@ def handle_youtube(url, num_frames, do_disease, do_detailed, lang, progress=gr.P
         return [], f"{t('error_prefix', lang)}: Could not process the video. Check the URL and try again.", "{}"
 
 
-def handle_image_upload(image, do_disease, do_detailed, lang):
+def handle_image_upload(image, do_disease, do_detailed, do_3d, lang):
     if image is None:
         return None, t("upload_placeholder", lang), "{}"
     try:
@@ -362,10 +406,10 @@ def handle_image_upload(image, do_disease, do_detailed, lang):
         else:
             return None, f"{t('error_prefix', lang)}: Unsupported format.", "{}"
 
-        ann_path, dets, rgb, qwen, disease, dt = detect_single_image(
-            upload_path, do_disease=do_disease, do_detailed=do_detailed
+        ann_path, dets, rgb, qwen, disease, dt, mt = detect_single_image(
+            upload_path, do_disease=do_disease, do_detailed=do_detailed, do_3d=do_3d,
         )
-        text = build_results_text(dets, rgb, qwen, disease, dt, lang)
+        text = build_results_text(dets, rgb, qwen, disease, dt, lang, mono_time=mt)
         json_data = {
             "detections": dets, "rgb_analyses": rgb,
             "qwen_analyses": qwen, "disease_assessment": disease,
@@ -380,12 +424,374 @@ def handle_image_upload(image, do_disease, do_detailed, lang):
         return None, f"{t('error_prefix', lang)}: Could not process the image. Please try a different file.", "{}"
 
 
+# ─── Stereo 3D Handlers ──────────────────────────────────────────────────────
+
+CALIBRATION_DIR = Path(__file__).parent / "calibration_data"
+
+
+def handle_add_calibration_images(left_images, right_images, board_cols, board_rows,
+                                  square_size, lang):
+    """Process uploaded checkerboard image pairs for stereo calibration."""
+    global stereo_calibrator
+    if not HAS_STEREO:
+        return f"{t('error_prefix', lang)}: Stereo module not available."
+
+    if not left_images or not right_images:
+        return f"{t('error_prefix', lang)}: {t('stereo_upload_both', lang)}"
+    if len(left_images) != len(right_images):
+        return f"{t('error_prefix', lang)}: Left ({len(left_images)}) and right ({len(right_images)}) image counts differ."
+
+    board_cols, board_rows = int(board_cols), int(board_rows)
+    cam_left = CameraCalibrator(board_size=(board_cols, board_rows), square_size_mm=float(square_size))
+    cam_right = CameraCalibrator(board_size=(board_cols, board_rows), square_size_mm=float(square_size))
+    stereo_calibrator = StereoCalibrator(cam_left, cam_right)
+
+    added = 0
+    for lp, rp in zip(left_images, right_images):
+        lpath = lp if isinstance(lp, str) else lp.name
+        rpath = rp if isinstance(rp, str) else rp.name
+        ok_l = cam_left.add_calibration_image(lpath)
+        ok_r = cam_right.add_calibration_image(rpath)
+        if ok_l and ok_r:
+            stereo_calibrator.add_stereo_pair(lpath, rpath)
+            added += 1
+
+    return f"{t('calib_images_used', lang)}: {added}/{len(left_images)}"
+
+
+def handle_run_calibration(lang):
+    """Run the full stereo calibration pipeline."""
+    global stereo_calibrator, depth_estimator
+    if not HAS_STEREO:
+        return f"{t('error_prefix', lang)}: Stereo module not available.", None
+
+    if stereo_calibrator is None:
+        return f"{t('calib_not_calibrated', lang)}: {t('calib_add_images', lang)}", None
+
+    try:
+        cam_left = stereo_calibrator.cam_left
+        cam_right = stereo_calibrator.cam_right
+
+        if len(cam_left._obj_points) < 3:
+            return t("calib_min_images", lang).replace("{n}", "3"), None
+
+        cam_left.calibrate(min_images=3)
+        cam_right.calibrate(min_images=3)
+        info = stereo_calibrator.calibrate_stereo(min_pairs=3)
+
+        depth_estimator = StereoDepthEstimator(stereo_calibrator)
+
+        status = (
+            f"**{t('calib_success', lang)}**\n\n"
+            f"- {t('calib_rms_error', lang)}: {info['rms_error']}\n"
+            f"- {t('calib_baseline', lang)}: {info['baseline_mm']} mm\n"
+            f"- {t('calib_images_used', lang)}: {info['num_pairs']}"
+        )
+        return status, None
+    except Exception as e:
+        return f"{t('calib_failed', lang)}: {e}", None
+
+
+def handle_save_calibration(lang):
+    """Save the current stereo calibration to disk."""
+    if stereo_calibrator is None or not stereo_calibrator.is_calibrated:
+        return t("calib_not_calibrated", lang)
+    CALIBRATION_DIR.mkdir(exist_ok=True)
+    path = CALIBRATION_DIR / "stereo_calibration.yaml"
+    stereo_calibrator.save(str(path))
+    return t("calib_saved", lang)
+
+
+def handle_load_calibration(file, lang):
+    """Load stereo calibration from an uploaded YAML file."""
+    global stereo_calibrator, depth_estimator
+    if not HAS_STEREO:
+        return f"{t('error_prefix', lang)}: Stereo module not available."
+    if file is None:
+        return t("calib_not_calibrated", lang)
+
+    try:
+        filepath = file if isinstance(file, str) else file.name
+        cam_l = CameraCalibrator()
+        cam_r = CameraCalibrator()
+        stereo_calibrator = StereoCalibrator(cam_l, cam_r)
+        stereo_calibrator.load(filepath)
+        depth_estimator = StereoDepthEstimator(stereo_calibrator)
+
+        baseline_mm = float(np.linalg.norm(stereo_calibrator.T))
+        status = (
+            f"**{t('calib_loaded', lang)}**\n\n"
+            f"- {t('calib_rms_error', lang)}: {stereo_calibrator.rms_error:.4f}\n"
+            f"- {t('calib_baseline', lang)}: {baseline_mm:.1f} mm"
+        )
+        return status
+    except Exception as e:
+        return f"{t('calib_failed', lang)}: {e}"
+
+
+def handle_stereo_detect(left_image, right_image, demo_mode, do_disease, do_detailed, lang):
+    """Run 3D stereo detection on a pair of images or in demo mode."""
+    global depth_estimator
+    if not HAS_STEREO:
+        return None, None, f"{t('error_prefix', lang)}: Stereo module not available.", "{}"
+
+    try:
+        # Save input images to temp files
+        if demo_mode:
+            if left_image is None:
+                return None, None, t("stereo_upload_or_demo", lang), "{}"
+            upload_path = os.path.join(TEMP_DIR, "stereo_demo_input.jpg")
+            if isinstance(left_image, np.ndarray):
+                cv2.imwrite(upload_path, cv2.cvtColor(left_image, cv2.COLOR_RGB2BGR),
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+            else:
+                upload_path = left_image
+            img = cv2.imread(upload_path)
+            h, w = img.shape[:2]
+            left_arr, right_arr = generate_synthetic_stereo_pair(upload_path)
+            left_path = os.path.join(TEMP_DIR, "stereo_left.jpg")
+            right_path = os.path.join(TEMP_DIR, "stereo_right.jpg")
+            cv2.imwrite(left_path, left_arr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            cv2.imwrite(right_path, right_arr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            stereo_cal = generate_synthetic_calibration(image_size=(w, h))
+            est = StereoDepthEstimator(stereo_cal)
+        else:
+            if left_image is None or right_image is None:
+                return None, None, t("stereo_upload_both", lang), "{}"
+            left_path = os.path.join(TEMP_DIR, "stereo_left.jpg")
+            right_path = os.path.join(TEMP_DIR, "stereo_right.jpg")
+            if isinstance(left_image, np.ndarray):
+                cv2.imwrite(left_path, cv2.cvtColor(left_image, cv2.COLOR_RGB2BGR),
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+            else:
+                left_path = left_image
+            if isinstance(right_image, np.ndarray):
+                cv2.imwrite(right_path, cv2.cvtColor(right_image, cv2.COLOR_RGB2BGR),
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+            else:
+                right_path = right_image
+
+            if depth_estimator is None or not stereo_calibrator or not stereo_calibrator.is_calibrated:
+                return None, None, t("stereo_not_calibrated_error", lang), "{}"
+            est = depth_estimator
+            stereo_cal = stereo_calibrator
+
+        # Run YOLO detection on left image
+        yolo = get_yolo()
+        t0 = time.time()
+        detections = yolo.detect(left_path)
+        det_time = time.time() - t0
+
+        # RGB analysis
+        left_img = cv2.imread(left_path)
+        rgb_analyses = []
+        if left_img is not None:
+            for det in detections:
+                bbox = det.get("bbox_2d", [])
+                rgb_analyses.append(
+                    analyze_rgb_ripeness(left_img, bbox) if len(bbox) == 4 else {}
+                )
+
+        # Rectify and compute 3D
+        right_img = cv2.imread(right_path)
+        left_rect, right_rect = stereo_cal.rectify_pair(left_img, right_img)
+        t0_stereo = time.time()
+        disparity, detections = est.compute_full_3d(left_rect, right_rect, detections)
+        stereo_time = time.time() - t0_stereo
+
+        # Annotated left image
+        ann_path = os.path.join(TEMP_DIR, "outputs", "stereo_annotated.jpg")
+        if detections:
+            visualize_detections(left_path, detections, ann_path, rgb_analyses, show_3d=True)
+        else:
+            shutil.copy2(left_path, ann_path)
+        annotated = cv2.imread(ann_path)
+        if annotated is not None:
+            annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+        # Depth overlay
+        depth_vis = draw_depth_overlay(left_rect, disparity, detections)
+        depth_vis_rgb = cv2.cvtColor(depth_vis, cv2.COLOR_BGR2RGB)
+
+        # Build results text
+        lines = []
+        if demo_mode:
+            lines.append(f"> **{t('stereo_demo_banner', lang)}**\n")
+        lines.append(f"### {t('stereo_results_label', lang)}")
+        lines.append(
+            f"**{t('strawberries_found', lang)}: {len(detections)}** — "
+            f"YOLO11: {det_time * 1000:.1f}ms | Stereo 3D: {stereo_time * 1000:.1f}ms\n"
+        )
+        if not detections:
+            lines.append(t("no_strawberries", lang))
+        else:
+            for i, det in enumerate(detections):
+                yolo_cls = det.get("yolo_class", det.get("ripeness", "unknown"))
+                conf = det.get("confidence_score", 0)
+                lines.append(f"**{t('strawberry_n', lang)} #{i + 1}**")
+                lines.append(
+                    f"- {t('class_label', lang)}: {yolo_cls} | "
+                    f"{t('confidence_label', lang)}: {conf:.0%}"
+                )
+                lines.append(f"- {t('position_label', lang)}: {det.get('bbox_2d')}")
+
+                if i < len(rgb_analyses) and "error" not in rgb_analyses[i]:
+                    rgb = rgb_analyses[i]
+                    harvest = t("harvest_yes", lang) if rgb.get("harvest_ready") else t("harvest_no", lang)
+                    lines.append(
+                        f"- {t('rgb_label', lang)}: "
+                        f"{t('ripe_pct', lang)}={rgb.get('ripeness_percentage', '?')}% | "
+                        f"{t('harvest_ready', lang)}: {harvest}"
+                    )
+
+                pos = det.get("position_3d")
+                if pos:
+                    c = pos["center_3d"]
+                    lines.append(
+                        f"- **{t('position_3d_label', lang)}**: "
+                        f"X={c['x_mm']:.1f}, Y={c['y_mm']:.1f}, Z={c['z_mm']:.1f} {t('unit_mm', lang)}"
+                    )
+                    lines.append(
+                        f"- **{t('depth_label', lang)}**: {pos['depth_mm'] / 10:.1f} {t('unit_cm', lang)} | "
+                        f"**{t('size_3d_label', lang)}**: "
+                        f"{pos['size_3d']['width_mm']:.0f} x {pos['size_3d']['height_mm']:.0f} {t('unit_mm', lang)} | "
+                        f"**{t('confidence_3d', lang)}**: {pos['confidence']}"
+                    )
+                lines.append("")
+
+        text = "\n".join(lines)
+        json_data = {
+            "detections": detections,
+            "rgb_analyses": rgb_analyses,
+            "detection_time_ms": round(det_time * 1000, 1),
+            "stereo_3d_time_ms": round(stereo_time * 1000, 1),
+            "demo_mode": demo_mode,
+        }
+        return annotated, depth_vis_rgb, text, json.dumps(json_data, indent=2, default=str)
+
+    except Exception as e:
+        print(f"[Stereo error] {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, f"{t('error_prefix', lang)}: {e}", "{}"
+
+
+def handle_mono_detect(image, lang):
+    """Run monocular 3D estimation on a single image using known strawberry size."""
+    if not HAS_STEREO:
+        return None, None, f"{t('error_prefix', lang)}: Stereo module not available.", "{}"
+    if image is None:
+        return None, None, t("stereo_upload_or_demo", lang), "{}"
+
+    try:
+        upload_path = os.path.join(TEMP_DIR, "mono_input.jpg")
+        if isinstance(image, np.ndarray):
+            cv2.imwrite(upload_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+        else:
+            upload_path = image
+
+        img = cv2.imread(upload_path)
+        if img is None:
+            return None, None, f"{t('error_prefix', lang)}: Cannot read image.", "{}"
+        h, w = img.shape[:2]
+
+        # YOLO detection
+        yolo = get_yolo()
+        t0 = time.time()
+        detections = yolo.detect(upload_path)
+        det_time = time.time() - t0
+
+        # RGB analysis
+        rgb_analyses = []
+        for det in detections:
+            bbox = det.get("bbox_2d", [])
+            rgb_analyses.append(
+                analyze_rgb_ripeness(img, bbox) if len(bbox) == 4 else {}
+            )
+
+        # Monocular 3D
+        mono = MonocularDepthEstimator(image_size=(w, h))
+        t0_mono = time.time()
+        mono.compute_full_3d(detections)
+        mono_time = time.time() - t0_mono
+
+        # Annotated image
+        ann_path = os.path.join(TEMP_DIR, "outputs", "mono_annotated.jpg")
+        if detections:
+            visualize_detections(upload_path, detections, ann_path, rgb_analyses, show_3d=True)
+        else:
+            shutil.copy2(upload_path, ann_path)
+        annotated = cv2.imread(ann_path)
+        if annotated is not None:
+            annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+        # Build results text
+        lines = []
+        lines.append(f"> **{t('mono_banner', lang)}**\n")
+        lines.append(f"### {t('stereo_results_label', lang)}")
+        lines.append(
+            f"**{t('strawberries_found', lang)}: {len(detections)}** — "
+            f"YOLO11: {det_time * 1000:.1f}ms | Mono 3D: {mono_time * 1000:.1f}ms\n"
+        )
+        if not detections:
+            lines.append(t("no_strawberries", lang))
+        else:
+            for i, det in enumerate(detections):
+                yolo_cls = det.get("yolo_class", det.get("ripeness", "unknown"))
+                conf = det.get("confidence_score", 0)
+                lines.append(f"**{t('strawberry_n', lang)} #{i + 1}**")
+                lines.append(
+                    f"- {t('class_label', lang)}: {yolo_cls} | "
+                    f"{t('confidence_label', lang)}: {conf:.0%}"
+                )
+                lines.append(f"- {t('position_label', lang)}: {det.get('bbox_2d')}")
+
+                if i < len(rgb_analyses) and "error" not in rgb_analyses[i]:
+                    rgb = rgb_analyses[i]
+                    harvest = t("harvest_yes", lang) if rgb.get("harvest_ready") else t("harvest_no", lang)
+                    lines.append(
+                        f"- {t('rgb_label', lang)}: "
+                        f"{t('ripe_pct', lang)}={rgb.get('ripeness_percentage', '?')}% | "
+                        f"{t('harvest_ready', lang)}: {harvest}"
+                    )
+
+                pos = det.get("position_3d")
+                if pos:
+                    c = pos["center_3d"]
+                    lines.append(
+                        f"- **{t('position_3d_label', lang)}**: "
+                        f"X={c['x_mm']:.1f}, Y={c['y_mm']:.1f}, Z={c['z_mm']:.1f} {t('unit_mm', lang)}"
+                    )
+                    lines.append(
+                        f"- **{t('depth_label', lang)}**: {pos['depth_mm'] / 10:.1f} {t('unit_cm', lang)} | "
+                        f"**{t('confidence_3d', lang)}**: {pos['confidence']}"
+                    )
+                lines.append("")
+
+        text = "\n".join(lines)
+        json_data = {
+            "detections": detections,
+            "rgb_analyses": rgb_analyses,
+            "detection_time_ms": round(det_time * 1000, 1),
+            "mono_3d_time_ms": round(mono_time * 1000, 1),
+            "method": "monocular_size",
+        }
+        return annotated, None, text, json.dumps(json_data, indent=2, default=str)
+
+    except Exception as e:
+        print(f"[Mono error] {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, f"{t('error_prefix', lang)}: {e}", "{}"
+
+
 # ─── Tab helpers (custom buttons instead of gr.Tabs for dynamic labels) ──────
 
 def _select_tab(idx):
-    """Return visibility + variant updates for 3 panels + 3 buttons."""
-    panels = [gr.update(visible=(i == idx)) for i in range(3)]
-    buttons = [gr.update(variant="primary" if i == idx else "secondary") for i in range(3)]
+    """Return visibility + variant updates for 4 panels + 4 buttons."""
+    panels = [gr.update(visible=(i == idx)) for i in range(4)]
+    buttons = [gr.update(variant="primary" if i == idx else "secondary") for i in range(4)]
     return panels + buttons
 
 
@@ -399,6 +805,10 @@ def select_tab_1():
 
 def select_tab_2():
     return _select_tab(2)
+
+
+def select_tab_3():
+    return _select_tab(3)
 
 
 # ─── Language Switcher ────────────────────────────────────────────────────────
@@ -418,7 +828,9 @@ def switch_language(lang):
         gr.update(label=t("disease_label", lang)),
         # 5  yt_detailed
         gr.update(label=t("detailed_label", lang)),
-        # 6  yt_btn
+        # 6  yt_3d
+        gr.update(label=t("estimate_3d_label", lang)),
+        # 7  yt_btn
         gr.update(value=t("analyze_btn", lang)),
         # 7  yt_gallery
         gr.update(label=t("gallery_label", lang)),
@@ -430,7 +842,9 @@ def switch_language(lang):
         gr.update(label=t("disease_label", lang)),
         # 11 img_detailed
         gr.update(label=t("detailed_label", lang)),
-        # 12 img_btn
+        # 12 img_3d
+        gr.update(label=t("estimate_3d_label", lang)),
+        # 13 img_btn
         gr.update(value=t("detect_btn", lang)),
         # 13 img_output
         gr.update(label=t("result_image_label", lang)),
@@ -440,10 +854,31 @@ def switch_language(lang):
         gr.update(value=build_about_md(lang)),
         # 16 footer_md
         gr.update(value=t("footer", lang)),
-        # 17-19  tab buttons
+        # 17-20  tab buttons
         gr.update(value=t("tab_video", lang)),
         gr.update(value=t("tab_image", lang)),
+        gr.update(value=t("tab_stereo", lang)),
         gr.update(value=t("tab_about", lang)),
+        # 21-32  stereo panel
+        gr.update(value=f"### {t('stereo_calibration_title', lang)}"),
+        gr.update(label=t("calib_board_cols", lang)),
+        gr.update(label=t("calib_board_rows", lang)),
+        gr.update(label=t("calib_square_size", lang)),
+        gr.update(label=t("calib_left_images", lang)),
+        gr.update(label=t("calib_right_images", lang)),
+        gr.update(value=t("calib_add_images", lang)),
+        gr.update(value=t("calib_run", lang)),
+        gr.update(value=t("calib_save", lang)),
+        gr.update(value=f"### {t('stereo_detection_title', lang)}"),
+        gr.update(label=t("stereo_left_image", lang)),
+        gr.update(label=t("stereo_right_image", lang)),
+        gr.update(label=t("stereo_demo_mode", lang)),
+        gr.update(label=t("mono_mode", lang)),
+        gr.update(value=t("stereo_detect_btn", lang)),
+        gr.update(value=t("mono_detect_btn", lang)),
+        gr.update(label=t("result_image_label", lang)),
+        gr.update(label=t("stereo_depth_map", lang)),
+        gr.update(value=f"*{t('stereo_upload_or_demo', lang)}*"),
     ]
 
 
@@ -890,6 +1325,9 @@ def build_demo():
             tab_btn_image = gr.Button(
                 t("tab_image"), variant="secondary", size="sm",
             )
+            tab_btn_stereo = gr.Button(
+                t("tab_stereo"), variant="secondary", size="sm",
+            )
             tab_btn_about = gr.Button(
                 t("tab_about"), variant="secondary", size="sm",
             )
@@ -915,6 +1353,10 @@ def build_demo():
                         yt_detailed = gr.Checkbox(
                             label=t("detailed_label"), value=False,
                             elem_id="yt-detailed",
+                        )
+                        yt_3d = gr.Checkbox(
+                            label=t("estimate_3d_label"), value=False,
+                            elem_id="yt-3d",
                         )
                     with gr.Column(elem_classes=["action-btn"]):
                         yt_btn = gr.Button(t("analyze_btn"), variant="primary")
@@ -950,6 +1392,10 @@ def build_demo():
                             label=t("detailed_label"), value=False,
                             elem_id="img-detailed",
                         )
+                        img_3d = gr.Checkbox(
+                            label=t("estimate_3d_label"), value=False,
+                            elem_id="img-3d",
+                        )
                     with gr.Column(elem_classes=["action-btn"]):
                         img_btn = gr.Button(t("detect_btn"), variant="primary")
                 with gr.Column(scale=1):
@@ -964,7 +1410,85 @@ def build_demo():
             with gr.Accordion("JSON", open=False):
                 img_json = gr.Code(language="json", value="{}", lines=12)
 
-        # ── Panel 3: About ──
+        # ── Panel 3: Stereo 3D ──
+        with gr.Column(visible=False) as panel_stereo:
+            # ── Calibration section ──
+            st_calib_title = gr.Markdown(f"### {t('stereo_calibration_title')}")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        st_board_cols = gr.Number(
+                            value=9, label=t("calib_board_cols"),
+                            precision=0, minimum=3, maximum=20,
+                        )
+                        st_board_rows = gr.Number(
+                            value=6, label=t("calib_board_rows"),
+                            precision=0, minimum=3, maximum=20,
+                        )
+                        st_square_size = gr.Number(
+                            value=25.0, label=t("calib_square_size"),
+                            minimum=1.0, maximum=200.0,
+                        )
+                    st_left_files = gr.File(
+                        label=t("calib_left_images"),
+                        file_count="multiple", file_types=["image"],
+                    )
+                    st_right_files = gr.File(
+                        label=t("calib_right_images"),
+                        file_count="multiple", file_types=["image"],
+                    )
+                    with gr.Row():
+                        st_add_btn = gr.Button(t("calib_add_images"), variant="secondary", size="sm")
+                        st_run_btn = gr.Button(t("calib_run"), variant="primary", size="sm")
+                        st_save_btn = gr.Button(t("calib_save"), variant="secondary", size="sm")
+                    st_load_file = gr.File(
+                        label=t("calib_load"),
+                        file_count="single", file_types=[".yaml", ".yml"],
+                    )
+                with gr.Column(scale=1):
+                    st_calib_status = gr.Markdown(
+                        value=f"*{t('calib_not_calibrated')}*",
+                    )
+                    st_calib_preview = gr.Image(
+                        label=t("calib_preview"), type="numpy",
+                    )
+
+            gr.Markdown("---")
+
+            # ── 3D Detection section ──
+            st_det_title = gr.Markdown(f"### {t('stereo_detection_title')}")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    st_left_img = gr.Image(
+                        label=t("stereo_left_image"), type="numpy",
+                    )
+                    st_right_img = gr.Image(
+                        label=t("stereo_right_image"), type="numpy",
+                    )
+                    st_demo_mode = gr.Checkbox(
+                        label=t("stereo_demo_mode"), value=True,
+                    )
+                    st_mono_mode = gr.Checkbox(
+                        label=t("mono_mode"), value=False,
+                    )
+                    with gr.Row():
+                        st_detect_btn = gr.Button(t("stereo_detect_btn"), variant="primary")
+                        st_mono_btn = gr.Button(t("mono_detect_btn"), variant="secondary")
+                with gr.Column(scale=1):
+                    st_annotated = gr.Image(
+                        label=t("result_image_label"), type="numpy",
+                    )
+                    st_depth = gr.Image(
+                        label=t("stereo_depth_map"), type="numpy",
+                    )
+            with gr.Row():
+                st_results = gr.Markdown(
+                    value=f"*{t('stereo_upload_or_demo')}*",
+                )
+            with gr.Accordion("JSON", open=False):
+                st_json = gr.Code(language="json", value="{}", lines=12)
+
+        # ── Panel 4: About ──
         with gr.Column(visible=False) as panel_about:
             about_md = gr.Markdown(
                 build_about_md("en"), elem_id="about-section",
@@ -990,23 +1514,58 @@ def build_demo():
         }
         """
         tab_outputs = [
-            panel_video, panel_image, panel_about,
-            tab_btn_video, tab_btn_image, tab_btn_about,
+            panel_video, panel_image, panel_stereo, panel_about,
+            tab_btn_video, tab_btn_image, tab_btn_stereo, tab_btn_about,
         ]
         tab_btn_video.click(select_tab_0, outputs=tab_outputs, js=SLIDER_FIX_JS)
         tab_btn_image.click(select_tab_1, outputs=tab_outputs)
-        tab_btn_about.click(select_tab_2, outputs=tab_outputs)
+        tab_btn_stereo.click(select_tab_2, outputs=tab_outputs)
+        tab_btn_about.click(select_tab_3, outputs=tab_outputs)
 
         # ── Detection events ──
         yt_btn.click(
             handle_youtube,
-            [yt_url, yt_frames, yt_disease, yt_detailed, lang],
+            [yt_url, yt_frames, yt_disease, yt_detailed, yt_3d, lang],
             [yt_gallery, yt_results, yt_json],
         )
         img_btn.click(
             handle_image_upload,
-            [img_input, img_disease, img_detailed, lang],
+            [img_input, img_disease, img_detailed, img_3d, lang],
             [img_output, img_results, img_json],
+        )
+
+        # ── Stereo calibration events ──
+        st_add_btn.click(
+            handle_add_calibration_images,
+            [st_left_files, st_right_files, st_board_cols, st_board_rows, st_square_size, lang],
+            [st_calib_status],
+        )
+        st_run_btn.click(
+            handle_run_calibration,
+            [lang],
+            [st_calib_status, st_calib_preview],
+        )
+        st_save_btn.click(
+            handle_save_calibration,
+            [lang],
+            [st_calib_status],
+        )
+        st_load_file.change(
+            handle_load_calibration,
+            [st_load_file, lang],
+            [st_calib_status],
+        )
+        st_detect_btn.click(
+            lambda left, right, demo, lang_val: handle_stereo_detect(
+                left, right, demo, False, False, lang_val
+            ),
+            [st_left_img, st_right_img, st_demo_mode, lang],
+            [st_annotated, st_depth, st_results, st_json],
+        )
+        st_mono_btn.click(
+            handle_mono_detect,
+            [st_left_img, lang],
+            [st_annotated, st_depth, st_results, st_json],
         )
 
         # ── Language switch — updates every visible element ──
@@ -1015,10 +1574,17 @@ def build_demo():
             inputs=[lang],
             outputs=[
                 title_md, desc_md,
-                yt_url, yt_frames, yt_disease, yt_detailed, yt_btn, yt_gallery, yt_results,
-                img_input, img_disease, img_detailed, img_btn, img_output, img_results,
+                yt_url, yt_frames, yt_disease, yt_detailed, yt_3d, yt_btn, yt_gallery, yt_results,
+                img_input, img_disease, img_detailed, img_3d, img_btn, img_output, img_results,
                 about_md, footer_md,
-                tab_btn_video, tab_btn_image, tab_btn_about,
+                tab_btn_video, tab_btn_image, tab_btn_stereo, tab_btn_about,
+                # stereo panel
+                st_calib_title, st_board_cols, st_board_rows, st_square_size,
+                st_left_files, st_right_files,
+                st_add_btn, st_run_btn, st_save_btn,
+                st_det_title, st_left_img, st_right_img, st_demo_mode,
+                st_mono_mode, st_detect_btn, st_mono_btn,
+                st_annotated, st_depth, st_results,
             ],
         )
 

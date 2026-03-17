@@ -36,6 +36,21 @@ from datetime import datetime
 import cv2
 import numpy as np
 
+# Optional stereo 3D support
+try:
+    from stereo_calibration import (
+        StereoCalibrator,
+        StereoDepthEstimator,
+        CameraCalibrator,
+        MonocularDepthEstimator,
+        generate_synthetic_calibration,
+        generate_synthetic_stereo_pair,
+        draw_depth_overlay,
+    )
+    HAS_STEREO = True
+except ImportError:
+    HAS_STEREO = False
+
 
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 
@@ -365,7 +380,7 @@ RIPENESS_COLORS = {
     "flower": (255, 200, 0), "unknown": (128, 128, 128)
 }
 
-def visualize_detections(image_path, detections, output_path, rgb_analyses=None):
+def visualize_detections(image_path, detections, output_path, rgb_analyses=None, show_3d=False):
     img = cv2.imread(image_path)
     if img is None:
         return
@@ -393,6 +408,10 @@ def visualize_detections(image_path, detections, output_path, rgb_analyses=None)
 
         if rgb_analyses and i < len(rgb_analyses) and "ripeness_percentage" in rgb_analyses[i]:
             parts.append(f"ripe:{rgb_analyses[i]['ripeness_percentage']:.0f}%")
+
+        if show_3d and "position_3d" in det:
+            depth_cm = det["position_3d"]["depth_mm"] / 10.0
+            parts.append(f"z:{depth_cm:.0f}cm")
 
         label = " | ".join(parts)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -478,6 +497,63 @@ def process_frame(image_path, yolo_detector, qwen_detector=None,
     return result
 
 
+def process_stereo_frame(left_image_path, right_image_path, yolo_detector,
+                         depth_estimator, qwen_detector=None,
+                         do_disease=False, do_detailed=False, do_rgb=True):
+    """Process a stereo image pair: detect on the left image, compute 3D coordinates.
+
+    Runs the standard pipeline on the left image, then uses the calibrated stereo
+    pair to triangulate 3D positions for each detection.
+
+    Returns the same dict as process_frame() with added fields:
+      - detections[i]["position_3d"] — 3D coordinates for each detection
+      - "stereo_info" — baseline, calibration quality, etc.
+      - processing_time["stereo_3d"] — time for stereo computation
+    """
+    if not HAS_STEREO:
+        raise RuntimeError("Stereo support not available (stereo_calibration.py not found)")
+
+    # Run standard 2D pipeline on the left image
+    result = process_frame(
+        left_image_path, yolo_detector, qwen_detector,
+        do_disease=do_disease, do_detailed=do_detailed, do_rgb=do_rgb,
+    )
+    result["image_path_right"] = right_image_path
+
+    stereo_cal = depth_estimator.stereo_cal
+    if not stereo_cal.is_calibrated:
+        result["stereo_info"] = {"error": "Stereo pair not calibrated"}
+        return result
+
+    t0 = time.time()
+
+    # Read images and rectify
+    left_img = cv2.imread(left_image_path)
+    right_img = cv2.imread(right_image_path)
+    if left_img is None or right_img is None:
+        result["stereo_info"] = {"error": "Cannot read stereo images"}
+        return result
+
+    left_rect, right_rect = stereo_cal.rectify_pair(left_img, right_img)
+
+    # Compute 3D for all detections
+    disparity, _ = depth_estimator.compute_full_3d(
+        left_rect, right_rect, result["detections"],
+    )
+
+    result["processing_time"]["stereo_3d"] = round(time.time() - t0, 4)
+
+    baseline_mm = float(np.linalg.norm(stereo_cal.T))
+    result["stereo_info"] = {
+        "baseline_mm": round(baseline_mm, 2),
+        "calibration_rms": round(stereo_cal.rms_error, 4) if stereo_cal.rms_error else None,
+        "disparity_range": [int(depth_estimator.min_disparity),
+                            int(depth_estimator.min_disparity + depth_estimator.num_disparities)],
+    }
+
+    return result
+
+
 def process_frame_directory(frame_dir, output_dir, yolo_detector, qwen_detector=None,
                            visualize=True, do_disease=False, do_detailed=False,
                            legacy_mode=False, max_frames=0, frame_step=1):
@@ -548,11 +624,19 @@ def main():
     parser.add_argument("--qwen-model", type=str, default="mlx-community/Qwen3-VL-8B-Instruct-4bit")
     parser.add_argument("--adapter-path", type=str, default=None,
                         help="Path to MLX LoRA adapter directory")
+    parser.add_argument("--stereo-left", type=str, help="Left stereo image for 3D detection")
+    parser.add_argument("--stereo-right", type=str, help="Right stereo image for 3D detection")
+    parser.add_argument("--calibration", type=str, help="Path to stereo calibration YAML")
+    parser.add_argument("--mono-3d", action="store_true",
+                        help="Monocular 3D estimation (single camera, uses known strawberry size)")
+    parser.add_argument("--focal-length", type=float, default=None,
+                        help="Focal length in pixels (for --mono-3d; auto-estimated if omitted)")
     args = parser.parse_args()
 
-    if not args.image and not args.frames and not args.frames_root:
+    has_stereo_args = args.stereo_left and args.stereo_right
+    if not args.image and not args.frames and not args.frames_root and not has_stereo_args:
         parser.print_help()
-        print("\nError: Provide --image, --frames, or --frames-root")
+        print("\nError: Provide --image, --frames, --frames-root, or --stereo-left/--stereo-right")
         sys.exit(1)
 
     if not args.legacy and not os.path.exists(args.yolo_model):
@@ -566,18 +650,99 @@ def main():
     qwen = QwenVLDetector(args.qwen_model, adapter_path=args.adapter_path) if needs_qwen else None
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.image:
+    if has_stereo_args:
+        # ── Stereo 3D processing ──
+        if not HAS_STEREO:
+            print("\nError: stereo_calibration.py not found")
+            sys.exit(1)
+
+        print(f"\n{'='*60}\nStereo 3D: {args.stereo_left}\n{'='*60}")
+        yolo.load()
+        if qwen: qwen.load()
+
+        left_img = cv2.imread(args.stereo_left)
+        if left_img is None:
+            print(f"Error: cannot read {args.stereo_left}")
+            sys.exit(1)
+        h, w = left_img.shape[:2]
+
+        if args.calibration:
+            print(f"  Loading calibration: {args.calibration}")
+            cam_l, cam_r = CameraCalibrator(), CameraCalibrator()
+            stereo_cal = StereoCalibrator(cam_l, cam_r)
+            stereo_cal.load(args.calibration)
+        else:
+            print("  No calibration file — using synthetic parameters")
+            stereo_cal = generate_synthetic_calibration(image_size=(w, h))
+
+        estimator = StereoDepthEstimator(stereo_cal)
+        result = process_stereo_frame(
+            args.stereo_left, args.stereo_right, yolo, estimator, qwen,
+            do_disease=args.disease, do_detailed=args.detailed,
+        )
+
+        print(f"\n{'─'*60}\nDetections: {len(result['detections'])}")
+        for i, det in enumerate(result["detections"]):
+            cls = det.get("yolo_class", det.get("ripeness", "?"))
+            conf = det.get("confidence_score", "?")
+            pos_str = ""
+            if "position_3d" in det:
+                p = det["position_3d"]["center_3d"]
+                pos_str = f"  3D=({p['x_mm']}, {p['y_mm']}, {p['z_mm']})mm [{det['position_3d']['confidence']}]"
+            print(f"  #{i+1}: {cls} (conf={conf}) @ {det.get('bbox_2d')}{pos_str}")
+
+        t = result["processing_time"]
+        det_ms = t.get("detection", 0) * 1000
+        stereo_ms = t.get("stereo_3d", 0) * 1000
+        print(f"\n⏱  Detection: {det_ms:.1f}ms | Stereo 3D: {stereo_ms:.1f}ms")
+
+        if args.visualize:
+            viz = os.path.join(args.output_dir, f"stereo_{Path(args.stereo_left).name}")
+            visualize_detections(args.stereo_left, result["detections"], viz,
+                                 result.get("rgb_analyses"), show_3d=True)
+            print(f"✓ Annotated: {viz}")
+
+            # Depth overlay
+            left_img_r = cv2.imread(args.stereo_left)
+            right_img_r = cv2.imread(args.stereo_right)
+            left_rect, right_rect = stereo_cal.rectify_pair(left_img_r, right_img_r)
+            disp = estimator.compute_disparity(left_rect, right_rect)
+            depth_vis = draw_depth_overlay(left_rect, disp, result["detections"])
+            depth_path = os.path.join(args.output_dir, f"depth_{Path(args.stereo_left).name}")
+            cv2.imwrite(depth_path, depth_vis, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            print(f"✓ Depth map: {depth_path}")
+
+        with open(os.path.join(args.output_dir, "stereo_detection.json"), "w") as f:
+            json.dump(result, f, indent=2, default=str)
+
+    elif args.image:
         print(f"\n{'='*60}\nProcessing: {args.image}\n{'='*60}")
         if not args.legacy: yolo.load()
         if qwen: qwen.load()
         result = process_frame(args.image, yolo, qwen, do_disease=args.disease,
                                do_detailed=args.detailed, legacy_mode=args.legacy)
 
+        # Monocular 3D estimation (single camera, known strawberry size)
+        if args.mono_3d and HAS_STEREO and result["detections"]:
+            img_check = cv2.imread(args.image)
+            h_img, w_img = img_check.shape[:2] if img_check is not None else (480, 640)
+            mono = MonocularDepthEstimator(
+                focal_length_px=args.focal_length,
+                image_size=(w_img, h_img),
+            )
+            t0 = time.time()
+            mono.compute_full_3d(result["detections"])
+            result["processing_time"]["mono_3d"] = round(time.time() - t0, 4)
+
         print(f"\n{'─'*60}\nDetections: {len(result['detections'])}")
         for i, det in enumerate(result["detections"]):
             cls = det.get("yolo_class", det.get("ripeness", "?"))
             conf = det.get("confidence_score", "?")
-            print(f"  #{i+1}: {cls} (conf={conf}) @ {det.get('bbox_2d')}")
+            pos_str = ""
+            if "position_3d" in det:
+                p = det["position_3d"]["center_3d"]
+                pos_str = f"  3D=({p['x_mm']}, {p['y_mm']}, {p['z_mm']})mm [{det['position_3d']['confidence']}]"
+            print(f"  #{i+1}: {cls} (conf={conf}) @ {det.get('bbox_2d')}{pos_str}")
             if i < len(result.get("rgb_analyses", [])):
                 rgb = result["rgb_analyses"][i]
                 if "error" not in rgb:
@@ -589,11 +754,16 @@ def main():
 
         t = result["processing_time"]
         det_val = t.get("detection", 0)
-        print(f"\n⏱  Detection: {det_val*1000:.1f}ms" if det_val < 1 else f"\n⏱  Detection: {det_val}s")
+        timing = f"\n⏱  Detection: {det_val*1000:.1f}ms" if det_val < 1 else f"\n⏱  Detection: {det_val}s"
+        if "mono_3d" in t:
+            timing += f" | Mono 3D: {t['mono_3d']*1000:.1f}ms"
+        print(timing)
 
+        show_3d = args.mono_3d and any("position_3d" in d for d in result["detections"])
         if args.visualize:
             viz = os.path.join(args.output_dir, f"detected_{Path(args.image).name}")
-            visualize_detections(args.image, result["detections"], viz, result.get("rgb_analyses"))
+            visualize_detections(args.image, result["detections"], viz,
+                                 result.get("rgb_analyses"), show_3d=show_3d)
             print(f"✓ Annotated: {viz}")
 
         with open(os.path.join(args.output_dir, "single_detection.json"), "w") as f:
