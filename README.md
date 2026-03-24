@@ -22,7 +22,7 @@ Two-stage pipeline optimized for real-time inference:
 1. **Strawberry coordinate detection** — YOLO11s detects strawberry bounding boxes from greenhouse video/images
 2. **Ripeness assessment via RGB** — HSV/RGB color analysis with 5-stage classification (green, white, turning, ripe, overripe)
 3. **Disease detection** — Fine-tuned Qwen 3 VL identifies powdery mildew, anthracnose, botrytis, and leaf spot
-4. **3D coordinate calibration** — Methodology documented (multi-camera stereo calibration), pending hardware setup
+4. **3D coordinate estimation** — Monocular depth from known strawberry size (~10% median error) + stereo vision support with checkerboard calibration
 
 ## Features
 
@@ -102,6 +102,7 @@ python strawberry_detector.py --frames frames/VIDEO/ --disease --visualize
 ```
 strawberry-vla/
 ├── demo_app.py                 # Gradio web UI
+├── stereo_calibration.py        # 3D estimation & camera calibration
 ├── strawberry_detector.py      # Core detection pipeline (YOLO + Qwen VL + RGB)
 ├── train_strawberry_yolo.py    # YOLO11 fine-tuning script
 ├── compare_models.py           # Base vs fine-tuned model comparison
@@ -109,6 +110,7 @@ strawberry-vla/
 ├── requirements.txt            # Python dependencies
 ├── report.md                   # Phase 1 report
 ├── report_phase2.md            # Phase 2 report (fine-tuning results)
+├── report_phase3.md            # Phase 3 report (3D estimation & calibration)
 ├── locales/
 │   ├── en.json                 # English translations
 │   └── ja.json                 # Japanese translations
@@ -144,6 +146,7 @@ strawberry-vla/
 
 - [Phase 1 Report](report.md) — System architecture, YOLO training (1,060 images), RGB analysis, disease detection methodology
 - [Phase 2 Report](report_phase2.md) — Fine-tuning results (YOLO 4,536 images + Qwen 3 VL LoRA), model comparison, recommendations
+- [Phase 3 Report](report_phase3.md) — 3D coordinate estimation, camera calibration, validation results
 
 ## Tech Stack
 
