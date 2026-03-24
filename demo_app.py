@@ -1469,7 +1469,7 @@ def build_demo():
                         label=t("stereo_demo_mode"), value=True,
                     )
                     st_mono_mode = gr.Checkbox(
-                        label=t("mono_mode"), value=False,
+                        label=t("mono_mode"), value=False, interactive=True,
                     )
                     with gr.Row():
                         st_detect_btn = gr.Button(t("stereo_detect_btn"), variant="primary")
