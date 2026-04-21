@@ -390,6 +390,66 @@ def handle_youtube(url, num_frames, do_disease, do_detailed, do_3d, lang, progre
         return [], f"{t('error_prefix', lang)}: Could not process the video. Check the URL and try again.", "{}"
 
 
+def _resolve_file_path(file):
+    """Return a filesystem path from whatever Gradio passes for a File component."""
+    if file is None:
+        return None
+    if isinstance(file, str):
+        return file
+    if isinstance(file, dict):
+        return file.get("path") or file.get("name")
+    return getattr(file, "path", None) or getattr(file, "name", None)
+
+
+def handle_video_upload(video_file, num_frames, do_disease, do_detailed, do_3d, lang, progress=gr.Progress()):
+    video_path = _resolve_file_path(video_file)
+    if not video_path:
+        return [], t("video_file_placeholder", lang), "{}"
+    try:
+        progress(0.05, desc="Reading video...")
+        frame_paths = extract_sample_frames(video_path, num_frames=int(num_frames))
+        if not frame_paths:
+            return [], t("no_frames", lang), "{}"
+
+        all_annotated, all_text, all_json = [], [], []
+        for i, fp in enumerate(frame_paths):
+            progress(
+                0.1 + 0.85 * (i / len(frame_paths)),
+                desc=f"Frame {i + 1}/{len(frame_paths)}...",
+            )
+            ann_path, dets, rgb, qwen, disease, dt, mt = detect_single_image(
+                fp, do_disease=do_disease, do_detailed=do_detailed, do_3d=do_3d,
+            )
+            all_annotated.append(ann_path)
+            text = build_results_text(dets, rgb, qwen, disease, dt, lang, mono_time=mt)
+            all_text.append(
+                f"---\n**Frame {i + 1}** "
+                f"(t={Path(fp).stem.split('_t')[-1]})\n\n{text}"
+            )
+            all_json.append({
+                "detections": dets, "rgb_analyses": rgb,
+                "qwen_analyses": qwen, "disease_assessment": disease,
+                "detection_time_ms": round(dt * 1000, 1),
+            })
+
+        progress(1.0, desc="Done")
+        total = sum(len(j.get("detections", [])) for j in all_json)
+        summary = (
+            f"### {t('detection_results', lang)}\n"
+            f"**{t('summary_frames', lang)}:** {len(frame_paths)} | "
+            f"**{t('summary_total', lang)}:** {total} | "
+            f"**{t('summary_avg', lang)}:** {total / max(1, len(frame_paths)):.1f}\n\n"
+        )
+        return (
+            all_annotated,
+            summary + "\n\n".join(all_text),
+            json.dumps({"frames": all_json}, indent=2),
+        )
+    except Exception as e:
+        print(f"[Video upload error] {e}")
+        return [], f"{t('error_prefix', lang)}: Could not process the video. Please try a different file.", "{}"
+
+
 def handle_image_upload(image, do_disease, do_detailed, do_3d, lang):
     if image is None:
         return None, t("upload_placeholder", lang), "{}"
@@ -836,6 +896,10 @@ def switch_language(lang):
         gr.update(label=t("gallery_label", lang)),
         # 8  yt_results
         gr.update(value=f"*{t('results_placeholder', lang)}*"),
+        # 8b vid_file
+        gr.update(label=t("video_file_label", lang)),
+        # 8c vid_btn
+        gr.update(value=t("video_file_btn", lang)),
         # 9  img_input
         gr.update(label=t("upload_label", lang)),
         # 10 img_disease
@@ -1360,6 +1424,15 @@ def build_demo():
                         )
                     with gr.Column(elem_classes=["action-btn"]):
                         yt_btn = gr.Button(t("analyze_btn"), variant="primary")
+                    gr.Markdown("---")
+                    vid_file = gr.File(
+                        label=t("video_file_label"),
+                        file_count="single",
+                        file_types=[".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"],
+                        elem_id="vid-file",
+                    )
+                    with gr.Column(elem_classes=["action-btn"]):
+                        vid_btn = gr.Button(t("video_file_btn"), variant="secondary")
                 with gr.Column(scale=2):
                     yt_gallery = gr.Gallery(
                         label=t("gallery_label"),
@@ -1528,6 +1601,11 @@ def build_demo():
             [yt_url, yt_frames, yt_disease, yt_detailed, yt_3d, lang],
             [yt_gallery, yt_results, yt_json],
         )
+        vid_btn.click(
+            handle_video_upload,
+            [vid_file, yt_frames, yt_disease, yt_detailed, yt_3d, lang],
+            [yt_gallery, yt_results, yt_json],
+        )
         img_btn.click(
             handle_image_upload,
             [img_input, img_disease, img_detailed, img_3d, lang],
@@ -1575,6 +1653,7 @@ def build_demo():
             outputs=[
                 title_md, desc_md,
                 yt_url, yt_frames, yt_disease, yt_detailed, yt_3d, yt_btn, yt_gallery, yt_results,
+                vid_file, vid_btn,
                 img_input, img_disease, img_detailed, img_3d, img_btn, img_output, img_results,
                 about_md, footer_md,
                 tab_btn_video, tab_btn_image, tab_btn_stereo, tab_btn_about,

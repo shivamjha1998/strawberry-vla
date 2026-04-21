@@ -120,5 +120,9 @@
   "mono_banner": "MONOCULAR MODE — 3D estimated from known strawberry size, not stereo depth",
 
   "about_stereo": "3D Stereo Vision",
-  "about_stereo_text": "Stage 3 — Stereo vision with two calibrated cameras computes depth maps and 3D coordinates for each detected strawberry. Supports checkerboard calibration and includes a demo mode with synthetic stereo pairs. Monocular mode estimates 3D coordinates from a single camera using known strawberry dimensions."
+  "about_stereo_text": "Stage 3 — Stereo vision with two calibrated cameras computes depth maps and 3D coordinates for each detected strawberry. Supports checkerboard calibration and includes a demo mode with synthetic stereo pairs. Monocular mode estimates 3D coordinates from a single camera using known strawberry dimensions.",
+
+  "video_file_label": "Upload Video File",
+  "video_file_btn": "Analyze Video File",
+  "video_file_placeholder": "Upload a local video file to analyze."
 }
