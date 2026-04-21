@@ -42,7 +42,6 @@ try:
         generate_synthetic_calibration,
         generate_synthetic_stereo_pair,
         draw_depth_overlay,
-        draw_epipolar_lines,
     )
     HAS_STEREO = True
 except ImportError:
@@ -158,11 +157,13 @@ def _suppress_stderr():
 def extract_sample_frames(video_path: str, interval_seconds: float = 2.0) -> list:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        cap.release()
         raise RuntimeError(f"Could not open video: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if total_frames <= 0:
+        cap.release()
         raise RuntimeError("Video has no frames")
 
     frame_step = max(1, int(round(fps * interval_seconds)))
@@ -258,9 +259,9 @@ def detect_single_image(image_path, do_disease=False, do_detailed=False, do_3d=F
     annotated_path = os.path.join(
         TEMP_DIR, "outputs", f"annotated_{Path(image_path).name}"
     )
-    if detections:
+    if detections and img is not None:
         visualize_detections(image_path, detections, annotated_path, rgb_analyses,
-                             show_3d=do_3d)
+                             show_3d=do_3d, img=img)
     else:
         shutil.copy2(image_path, annotated_path)
 
@@ -362,14 +363,14 @@ def build_about_md(lang="ja"):
 
 # ─── Gradio Handlers ─────────────────────────────────────────────────────────
 
-def handle_youtube(url, num_frames, do_disease, do_detailed, do_3d, lang, progress=gr.Progress()):
+def handle_youtube(url, sample_interval, do_disease, do_detailed, do_3d, lang, progress=gr.Progress()):
     if not url or not url.strip():
         return [], t("enter_url", lang), "{}"
     try:
         progress(0.1, desc="Downloading...")
         video_path = download_youtube_video(url.strip())
         progress(0.2, desc="Extracting frames...")
-        frame_paths = extract_sample_frames(video_path, interval_seconds=float(num_frames))
+        frame_paths = extract_sample_frames(video_path, interval_seconds=float(sample_interval))
         if not frame_paths:
             return [], t("no_frames", lang), "{}"
 
@@ -423,13 +424,13 @@ def _resolve_file_path(file):
     return getattr(file, "path", None) or getattr(file, "name", None)
 
 
-def handle_video_upload(video_file, num_frames, do_disease, do_detailed, do_3d, lang, progress=gr.Progress()):
+def handle_video_upload(video_file, sample_interval, do_disease, do_detailed, do_3d, lang, progress=gr.Progress()):
     video_path = _resolve_file_path(video_file)
     if not video_path:
         return [], t("video_file_placeholder", lang), "{}"
     try:
         progress(0.05, desc="Reading video...")
-        frame_paths = extract_sample_frames(video_path, interval_seconds=float(num_frames))
+        frame_paths = extract_sample_frames(video_path, interval_seconds=float(sample_interval))
         if not frame_paths:
             return [], t("no_frames", lang), "{}"
 
@@ -611,7 +612,7 @@ def handle_load_calibration(file, lang):
         return f"{t('calib_failed', lang)}: {e}"
 
 
-def handle_stereo_detect(left_image, right_image, demo_mode, do_disease, do_detailed, lang):
+def handle_stereo_detect(left_image, right_image, demo_mode, lang):
     """Run 3D stereo detection on a pair of images or in demo mode."""
     global depth_estimator
     if not HAS_STEREO:
@@ -1337,6 +1338,124 @@ input[type="checkbox"]:checked + .gr-check-radio,
 .gr-padded { padding: 16px !important; }
 footer { display: none !important; }
 .built-with { display: none !important; }
+
+/* ════════════════════════════════════════════
+   MOBILE — tablet / large phone  (≤ 768 px)
+   ════════════════════════════════════════════ */
+@media (max-width: 768px) {
+
+    /* Container: trim side padding */
+    .gradio-container {
+        padding: 0 12px !important;
+    }
+
+    /* Language selector: pull out of absolute position so it
+       no longer overlaps the title on narrow screens */
+    #lang-row {
+        position: static !important;
+        right: auto !important;
+        top: auto !important;
+        justify-content: flex-end !important;
+        margin-bottom: 4px !important;
+        padding: 0 !important;
+    }
+
+    /* Header text: scale down */
+    #title-text { padding-top: 4px !important; }
+    #title-text h1 {
+        font-size: 20px !important;
+        letter-spacing: 2px !important;
+    }
+    #title-text p {
+        font-size: 12px !important;
+        letter-spacing: 1px !important;
+    }
+    #description-text p { font-size: 11px !important; }
+
+    /* Tab bar: allow buttons to wrap and share width equally */
+    #tab-nav {
+        flex-wrap: wrap !important;
+        justify-content: flex-start !important;
+    }
+    #tab-nav button {
+        flex: 1 1 auto !important;
+        min-width: 72px !important;
+        font-size: 11px !important;
+        padding: 9px 10px !important;
+        letter-spacing: 0.5px !important;
+        text-align: center !important;
+    }
+
+    /* Force Gradio row columns to stack:
+       Gradio 4-6 sets  min-width: min(160px, 100%)  on each column via
+       inline style; overriding that to 100% makes them wrap. */
+    .gradio-container [style*="min-width: min(160px"] {
+        min-width: 100% !important;
+        flex-basis: 100% !important;
+    }
+    /* Also catch the  min(320px…)  variant used in wider layouts */
+    .gradio-container [style*="min-width: min(320px"] {
+        min-width: 100% !important;
+        flex-basis: 100% !important;
+    }
+    /* Wrap the parent flex row so the now-full-width children stack */
+    .gradio-container .gap,
+    .gradio-container [class*="gap"] {
+        flex-wrap: wrap !important;
+    }
+
+    /* Gallery: shorter so controls above it remain reachable */
+    #yt-gallery { height: 280px !important; }
+
+    /* Action buttons: full-width with generous touch target */
+    .action-btn { width: 100% !important; }
+    .action-btn button,
+    .action-btn .primary {
+        width: 100% !important;
+        min-height: 48px !important;
+        padding: 12px 16px !important;
+    }
+
+    /* Checkboxes: wrap so they don't overflow on small screens */
+    .gradio-container .checkbox-group,
+    .gradio-container [class*="check"] {
+        flex-wrap: wrap !important;
+    }
+}
+
+/* ════════════════════════════════════════════
+   MOBILE — small phone  (≤ 480 px)
+   ════════════════════════════════════════════ */
+@media (max-width: 480px) {
+
+    .gradio-container { padding: 0 8px !important; }
+
+    #title-text h1 {
+        font-size: 17px !important;
+        letter-spacing: 1.5px !important;
+    }
+    #title-text p {
+        font-size: 11px !important;
+        letter-spacing: 0.8px !important;
+    }
+
+    /* Tab buttons: tighter, still wrap */
+    #tab-nav button {
+        font-size: 10px !important;
+        padding: 8px 8px !important;
+        min-width: 60px !important;
+    }
+
+    /* Gallery: compact */
+    #yt-gallery { height: 220px !important; }
+
+    /* Keep table readable — allow horizontal scroll */
+    .prose table, .md table {
+        display: block !important;
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+    }
+}
 .show-api { display: none !important; }
 .wrap.default { background: transparent !important; border: none !important; }
 
@@ -1368,33 +1487,7 @@ footer { display: none !important; }
 # ─── Build UI ─────────────────────────────────────────────────────────────────
 
 def build_demo():
-    with gr.Blocks(
-        title="Strawberry VLA",
-        css=CUSTOM_CSS,
-        theme=gr.themes.Base(
-            primary_hue=gr.themes.colors.red,
-            secondary_hue=gr.themes.colors.stone,
-            neutral_hue=gr.themes.colors.stone,
-        ).set(
-            body_background_fill="#f5f3f0",
-            body_text_color="#1a1a1a",
-            block_background_fill="transparent",
-            block_label_background_fill="#edeae7",
-            block_label_text_color="#2a2a2a",
-            block_title_text_color="#2a2a2a",
-            block_border_color="#ddd9d5",
-            input_background_fill="#ffffff",
-            input_placeholder_color="#888",
-            checkbox_background_color="#ffffff",
-            checkbox_background_color_selected="#d4918e",
-            checkbox_border_color="#c8c3be",
-            checkbox_border_color_selected="#d4918e",
-            checkbox_label_background_fill="transparent",
-            checkbox_label_text_color="#2a2a2a",
-            panel_background_fill="transparent",
-            slider_color="#d4918e",
-        ),
-    ) as demo:
+    with gr.Blocks(title="Strawberry VLA") as demo:
 
         # ── Header ──
         with gr.Row(elem_id="lang-row"):
@@ -1683,7 +1776,7 @@ def build_demo():
         )
         st_detect_btn.click(
             lambda left, right, demo, lang_val: handle_stereo_detect(
-                left, right, demo, False, False, lang_val
+                left, right, demo, lang_val
             ),
             [st_left_img, st_right_img, st_demo_mode, lang],
             [st_annotated, st_depth, st_results, st_json],
@@ -1797,6 +1890,30 @@ def main():
         share=args.share,
         show_error=True,
         favicon_path=str(favicon) if favicon.exists() else None,
+        css=CUSTOM_CSS,
+        theme=gr.themes.Base(
+            primary_hue=gr.themes.colors.red,
+            secondary_hue=gr.themes.colors.stone,
+            neutral_hue=gr.themes.colors.stone,
+        ).set(
+            body_background_fill="#f5f3f0",
+            body_text_color="#1a1a1a",
+            block_background_fill="transparent",
+            block_label_background_fill="#edeae7",
+            block_label_text_color="#2a2a2a",
+            block_title_text_color="#2a2a2a",
+            block_border_color="#ddd9d5",
+            input_background_fill="#ffffff",
+            input_placeholder_color="#888",
+            checkbox_background_color="#ffffff",
+            checkbox_background_color_selected="#d4918e",
+            checkbox_border_color="#c8c3be",
+            checkbox_border_color_selected="#d4918e",
+            checkbox_label_background_fill="transparent",
+            checkbox_label_text_color="#2a2a2a",
+            panel_background_fill="transparent",
+            slider_color="#d4918e",
+        ),
     )
 
 

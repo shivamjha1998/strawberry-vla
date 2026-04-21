@@ -380,10 +380,12 @@ RIPENESS_COLORS = {
     "flower": (255, 200, 0), "unknown": (128, 128, 128)
 }
 
-def visualize_detections(image_path, detections, output_path, rgb_analyses=None, show_3d=False):
-    img = cv2.imread(image_path)
+def visualize_detections(image_path, detections, output_path, rgb_analyses=None, show_3d=False, img=None):
+    if img is None:
+        img = cv2.imread(image_path)
     if img is None:
         return
+    img = img.copy()
 
     for i, det in enumerate(detections):
         bbox = det.get("bbox_2d", [])
