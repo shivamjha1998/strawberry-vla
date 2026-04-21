@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import atexit
+import contextlib
 import json
 import os
 import re
@@ -97,7 +98,7 @@ def load_locales():
             _locales[lang_file.stem] = json.load(f)
 
 
-def t(key, lang="en"):
+def t(key, lang="ja"):
     return _locales.get(lang, _locales.get("en", {})).get(key, key)
 
 
@@ -137,37 +138,57 @@ def download_youtube_video(url: str, max_duration: int = 120) -> str:
     raise RuntimeError("Video file not found after download")
 
 
-def extract_sample_frames(video_path: str, num_frames: int = 8) -> list:
+_MAX_FRAMES = 1000
+
+
+@contextlib.contextmanager
+def _suppress_stderr():
+    """Redirect C-level stderr to /dev/null to silence ffmpeg decoder noise (e.g. mmco warnings)."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+
+
+def extract_sample_frames(video_path: str, interval_seconds: float = 2.0) -> list:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if total_frames <= 0:
         raise RuntimeError("Video has no frames")
 
-    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+    frame_step = max(1, int(round(fps * interval_seconds)))
+    indices = list(range(0, total_frames, frame_step))[:_MAX_FRAMES]
+
     frames_dir = os.path.join(TEMP_DIR, "frames")
     for f in Path(frames_dir).glob("frame_*.jpg"):
         os.remove(f)
 
     frame_paths = []
-    for target_idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        timestamp = target_idx / fps if fps > 0 else 0
-        h, w = frame.shape[:2]
-        if max(h, w) > 1280:
-            scale = 1280 / max(h, w)
-            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
-        frame_path = os.path.join(
-            frames_dir, f"frame_{len(frame_paths):04d}_t{timestamp:.1f}s.jpg"
-        )
-        cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        frame_paths.append(frame_path)
+    with _suppress_stderr():
+        for target_idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            timestamp = target_idx / fps
+            h, w = frame.shape[:2]
+            if max(h, w) > 1280:
+                scale = 1280 / max(h, w)
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            frame_path = os.path.join(
+                frames_dir, f"frame_{len(frame_paths):04d}_t{timestamp:.1f}s.jpg"
+            )
+            cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            frame_paths.append(frame_path)
 
     cap.release()
     return frame_paths
@@ -181,6 +202,7 @@ def detect_single_image(image_path, do_disease=False, do_detailed=False, do_3d=F
     t0 = time.time()
     detections = yolo.detect(image_path)
     det_time = time.time() - t0
+    detections = [d for d in detections if d.get("confidence_score", 0) >= 0.60]
 
     img = cv2.imread(image_path)
     rgb_analyses = []
@@ -317,7 +339,7 @@ def build_results_text(detections, rgb_analyses, qwen_analyses, disease_result, 
 
 # ─── About section builder ───────────────────────────────────────────────────
 
-def build_about_md(lang="en"):
+def build_about_md(lang="ja"):
     return (
         f"### {t('about_architecture', lang)}\n\n"
         f"{t('about_arch_text', lang)}\n\n"
@@ -347,7 +369,7 @@ def handle_youtube(url, num_frames, do_disease, do_detailed, do_3d, lang, progre
         progress(0.1, desc="Downloading...")
         video_path = download_youtube_video(url.strip())
         progress(0.2, desc="Extracting frames...")
-        frame_paths = extract_sample_frames(video_path, num_frames=int(num_frames))
+        frame_paths = extract_sample_frames(video_path, interval_seconds=float(num_frames))
         if not frame_paths:
             return [], t("no_frames", lang), "{}"
 
@@ -407,7 +429,7 @@ def handle_video_upload(video_file, num_frames, do_disease, do_detailed, do_3d, 
         return [], t("video_file_placeholder", lang), "{}"
     try:
         progress(0.05, desc="Reading video...")
-        frame_paths = extract_sample_frames(video_path, num_frames=int(num_frames))
+        frame_paths = extract_sample_frames(video_path, interval_seconds=float(num_frames))
         if not frame_paths:
             return [], t("no_frames", lang), "{}"
 
@@ -898,7 +920,15 @@ def switch_language(lang):
         gr.update(value=f"*{t('results_placeholder', lang)}*"),
         # 8b vid_file
         gr.update(label=t("video_file_label", lang)),
-        # 8c vid_btn
+        # 8b2 vid_frames
+        gr.update(label=t("frames_label", lang)),
+        # 8c vid_disease
+        gr.update(label=t("disease_label", lang)),
+        # 8d vid_detailed
+        gr.update(label=t("detailed_label", lang)),
+        # 8e vid_3d
+        gr.update(label=t("estimate_3d_label", lang)),
+        # 8f vid_btn
         gr.update(value=t("video_file_btn", lang)),
         # 9  img_input
         gr.update(label=t("upload_label", lang)),
@@ -1370,7 +1400,7 @@ def build_demo():
         with gr.Row(elem_id="lang-row"):
             lang = gr.Dropdown(
                 choices=[("English", "en"), ("日本語", "ja")],
-                value="en",
+                value="ja",
                 label=t("language_label"),
                 elem_id="lang-selector",
                 interactive=True,
@@ -1406,7 +1436,7 @@ def build_demo():
                         elem_id="yt-url",
                     )
                     yt_frames = gr.Slider(
-                        2, 16, 6, step=1, label=t("frames_label"),
+                        0.5, 30.0, 2.0, step=0.5, label=t("frames_label"),
                         elem_id="yt-frames",
                     )
                     with gr.Row():
@@ -1431,16 +1461,34 @@ def build_demo():
                         file_types=[".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"],
                         elem_id="vid-file",
                     )
+                    vid_frames = gr.Slider(
+                        0.5, 30.0, 2.0, step=0.5, label=t("frames_label"),
+                        elem_id="vid-frames",
+                    )
+                    with gr.Row():
+                        vid_disease = gr.Checkbox(
+                            label=t("disease_label"), value=False,
+                            elem_id="vid-disease",
+                        )
+                        vid_detailed = gr.Checkbox(
+                            label=t("detailed_label"), value=False,
+                            elem_id="vid-detailed",
+                        )
+                        vid_3d = gr.Checkbox(
+                            label=t("estimate_3d_label"), value=False,
+                            elem_id="vid-3d",
+                        )
                     with gr.Column(elem_classes=["action-btn"]):
                         vid_btn = gr.Button(t("video_file_btn"), variant="secondary")
                 with gr.Column(scale=2):
                     yt_gallery = gr.Gallery(
                         label=t("gallery_label"),
                         columns=3,
-                        height=420,
+                        height=600,
                         object_fit="cover",
                         elem_id="yt-gallery",
                     )
+
             with gr.Row():
                 yt_results = gr.Markdown(
                     value=f"*{t('results_placeholder')}*",
@@ -1564,7 +1612,7 @@ def build_demo():
         # ── Panel 4: About ──
         with gr.Column(visible=False) as panel_about:
             about_md = gr.Markdown(
-                build_about_md("en"), elem_id="about-section",
+                build_about_md("ja"), elem_id="about-section",
             )
 
         footer_md = gr.Markdown(t("footer"), elem_id="footer-text")
@@ -1603,7 +1651,7 @@ def build_demo():
         )
         vid_btn.click(
             handle_video_upload,
-            [vid_file, yt_frames, yt_disease, yt_detailed, yt_3d, lang],
+            [vid_file, vid_frames, vid_disease, vid_detailed, vid_3d, lang],
             [yt_gallery, yt_results, yt_json],
         )
         img_btn.click(
@@ -1653,7 +1701,7 @@ def build_demo():
             outputs=[
                 title_md, desc_md,
                 yt_url, yt_frames, yt_disease, yt_detailed, yt_3d, yt_btn, yt_gallery, yt_results,
-                vid_file, vid_btn,
+                vid_file, vid_frames, vid_disease, vid_detailed, vid_3d, vid_btn,
                 img_input, img_disease, img_detailed, img_3d, img_btn, img_output, img_results,
                 about_md, footer_md,
                 tab_btn_video, tab_btn_image, tab_btn_stereo, tab_btn_about,
@@ -1692,6 +1740,30 @@ def build_demo():
                     el.id = 'field-' + Math.random().toString(36).slice(2, 8);
                 });
             }, 500);
+        }
+        """)
+
+        # ── Gallery lightbox: redirect vertical wheel → horizontal scroll ──
+        demo.load(fn=None, js="""
+        () => {
+            document.addEventListener('wheel', function(e) {
+                // Walk up from the event target looking for a horizontally
+                // scrollable container (the lightbox thumbnail filmstrip).
+                let el = e.target;
+                for (let i = 0; i < 12 && el && el !== document.body; i++, el = el.parentElement) {
+                    if (el.scrollWidth > el.clientWidth + 4) {
+                        const ov = getComputedStyle(el).overflowX;
+                        if (ov === 'auto' || ov === 'scroll') {
+                            // Only redirect if the user isn't already scrolling horizontally
+                            if (Math.abs(e.deltaX) < 2) {
+                                e.preventDefault();
+                                el.scrollLeft += e.deltaY;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }, { passive: false });
         }
         """)
 

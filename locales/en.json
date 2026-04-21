@@ -10,7 +10,7 @@
   "language_label": "Language",
   "yt_url_label": "YouTube URL",
   "yt_url_placeholder": "Paste a YouTube URL here",
-  "frames_label": "Frames to extract",
+  "frames_label": "Sample every N seconds",
   "disease_label": "Disease detection",
   "detailed_label": "Detailed analysis (Qwen VL)",
   "analyze_btn": "Analyze",

@@ -10,7 +10,7 @@
   "language_label": "言語",
   "yt_url_label": "YouTube URL",
   "yt_url_placeholder": "YouTube URLを貼り付けてください",
-  "frames_label": "抽出フレーム数",
+  "frames_label": "サンプリング間隔（秒）",
   "disease_label": "病害検出",
   "detailed_label": "詳細分析 (Qwen VL)",
   "analyze_btn": "分析開始",
