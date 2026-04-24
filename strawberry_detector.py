@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import base64
 import gc
 import json
 import os
@@ -44,7 +45,6 @@ try:
         CameraCalibrator,
         MonocularDepthEstimator,
         generate_synthetic_calibration,
-        generate_synthetic_stereo_pair,
         draw_depth_overlay,
     )
     HAS_STEREO = True
@@ -76,13 +76,13 @@ Important:
 - Include ALL visible strawberries, even partially occluded ones
 - Be accurate with ripeness: green=unripe, white=early, turning=partially red, ripe=fully red, overripe=dark/mushy"""
 
-DISEASE_PROMPT = """Analyze this image of strawberries for signs of disease.
+DISEASE_PROMPT = """Analyze this cropped image of a single strawberry fruit for signs of disease or damage.
 
-Look specifically for:
-1. Powdery mildew: white/gray powdery coating on leaves or fruit
-2. Anthracnose: dark, sunken lesions on fruit; may have pink/orange spore masses
-3. Botrytis (gray mold): fuzzy gray mold on fruit
-4. Leaf spot: dark spots on leaves
+Look specifically for conditions visible on the fruit surface:
+1. Botrytis (gray mold): fuzzy gray or brown mold on the fruit surface
+2. Anthracnose: dark, sunken lesions or craters on the fruit; may have pink/orange spore masses
+3. Surface mold: any unusual white, green, or black coating or discoloration
+4. Bruising / overripeness: soft dark patches, skin breakdown, or weeping areas
 
 Output ONLY a JSON object in this exact format:
 {
@@ -90,15 +90,15 @@ Output ONLY a JSON object in this exact format:
     {
       "disease": "disease name",
       "severity": "none|mild|moderate|severe",
-      "location": "description of where on the plant",
+      "location": "description of where on the fruit",
       "confidence": "high|medium|low"
     }
   ],
   "overall_plant_health": "healthy|mild_issues|moderate_issues|severe_issues",
-  "notes": "brief observation"
+  "notes": "brief observation about the fruit surface condition"
 }
 
-If the plants look healthy, output diseases_detected as an empty array."""
+If the fruit looks healthy, output diseases_detected as an empty array."""
 
 RIPENESS_DETAIL_PROMPT = """Analyze the ripeness of the strawberry in this cropped image.
 
@@ -194,59 +194,54 @@ class YOLODetector:
 # ─── Qwen VL Detector (SECONDARY — analysis) ─────────────────────────────────
 
 class QwenVLDetector:
-    """Qwen 3 VL — used for detailed crop analysis & disease detection.
+    """Qwen VL via OpenAI-compatible API for detailed crop analysis & disease detection.
 
-    Supports optional LoRA adapter for fine-tuned strawberry analysis.
+    Connects to a local or remote vLLM server serving Qwen3.6-35B-A3B.
+    Configure via QWEN_API_BASE and QWEN_MODEL environment variables.
     """
 
-    def __init__(self, model_path="mlx-community/Qwen3-VL-8B-Instruct-4bit",
-                 adapter_path=None):
-        self.model_path = model_path
-        self.adapter_path = adapter_path
-        self.model = None
-        self.processor = None
-        self.config = None
+    _MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+             ".png": "image/png", ".webp": "image/webp"}
+
+    def __init__(self, base_url: str = None, model: str = None):
+        self.base_url = base_url or os.environ.get("QWEN_API_BASE", "http://localhost:8000/v1")
+        self.model = model or os.environ.get("QWEN_MODEL", "Qwen3.6-35B-A3B")
+        self._client = None
 
     def load(self):
-        if self.model is not None:
+        if self._client is not None:
             return
-        label = "Qwen 3 VL + LoRA" if self.adapter_path else "Qwen 3 VL"
-        print(f"  Loading {label} ({self.model_path})...")
-        if self.adapter_path:
-            print(f"  Adapter: {self.adapter_path}")
-        load_start = time.time()
-        from mlx_vlm import load, generate
-        from mlx_vlm.prompt_utils import apply_chat_template
-        from mlx_vlm.utils import load_config
-        self.model, self.processor = load(self.model_path,
-                                          adapter_path=self.adapter_path)
-        self.config = load_config(self.model_path)
-        self._generate = generate
-        self._apply_chat_template = apply_chat_template
-        print(f"  ✓ {label} loaded in {time.time() - load_start:.1f}s")
+        from openai import OpenAI
+        self._client = OpenAI(base_url=self.base_url, api_key="not-needed")
+        print(f"  ✓ Qwen API client ready — {self.base_url}  model={self.model}")
 
     def unload(self):
-        if self.model is not None:
-            del self.model
-            del self.processor
-            self.model = None
-            self.processor = None
-            gc.collect()
-            print("  ✓ Qwen VL unloaded")
+        self._client = None
+        print("  ✓ Qwen API client released")
 
-    def _run_inference(self, image_path: str, prompt: str, max_tokens: int = 1000) -> str:
+    def _run_inference(self, image_path: str, prompt: str, max_tokens: int = 6144) -> str:
         self.load()
-        formatted_prompt = self._apply_chat_template(
-            self.processor, self.config, prompt, num_images=1
-        )
-        result = self._generate(
-            self.model, self.processor, formatted_prompt, [image_path],
-            max_tokens=max_tokens, verbose=False
-        )
-        # mlx_vlm >= 0.1.x returns a GenerationResult object, not a string
-        if isinstance(result, str):
-            return result
-        return getattr(result, "text", str(result))
+        ext = Path(image_path).suffix.lower()
+        mime = self._MIME.get(ext, "image/jpeg")
+        with open(image_path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+                max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            print(f"    [Qwen API error] {e}")
+            return ""
 
     def detect_strawberries(self, image_path: str) -> list:
         """Legacy: full-frame detection via Qwen VL (slow)."""
@@ -261,14 +256,14 @@ class QwenVLDetector:
         return detections
 
     def assess_disease(self, image_path: str) -> dict:
-        raw_output = self._run_inference(image_path, DISEASE_PROMPT)
+        raw_output = self._run_inference(image_path, DISEASE_PROMPT, max_tokens=3072)
         return self._parse_json_response(raw_output, expected_type=dict, default={
-            "diseases_detected": [], "overall_plant_health": "unknown",
-            "notes": "Could not parse response"
+            "diseases_detected": [], "overall_plant_health": "assessment_failed",
+            "notes": "Could not parse Qwen response"
         })
 
     def assess_ripeness_detail(self, image_path: str) -> dict:
-        raw_output = self._run_inference(image_path, RIPENESS_DETAIL_PROMPT, max_tokens=500)
+        raw_output = self._run_inference(image_path, RIPENESS_DETAIL_PROMPT, max_tokens=6144)
         return self._parse_json_response(raw_output, expected_type=dict, default={
             "ripeness_stage": "unknown", "ripeness_percentage": -1,
             "notes": "Could not parse response"
@@ -278,7 +273,8 @@ class QwenVLDetector:
     def _parse_json_response(text, expected_type=list, default=None):
         if default is None:
             default = [] if expected_type == list else {}
-        text = text.strip()
+        # Strip thinking tokens emitted by Qwen3.6 reasoning mode
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
         try:
             result = json.loads(text)
             if isinstance(result, expected_type):

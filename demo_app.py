@@ -77,9 +77,7 @@ def get_yolo():
 def get_qwen():
     global qwen_detector
     if qwen_detector is None:
-        qwen_detector = QwenVLDetector(
-            adapter_path="output/v2-20260308-003328/checkpoint-861-mlx"
-        )
+        qwen_detector = QwenVLDetector()
         qwen_detector.load()
     return qwen_detector
 
@@ -251,10 +249,32 @@ def detect_single_image(image_path, do_disease=False, do_detailed=False, do_3d=F
                     if os.path.exists(crop_path):
                         os.unlink(crop_path)
 
-    disease_result = None
-    if do_disease:
+    disease_results = []
+    if do_disease and detections and img is not None:
         qwen = get_qwen()
-        disease_result = qwen.assess_disease(image_path)
+        h, w = img.shape[:2]
+        for det in detections:
+            bbox = det.get("bbox_2d", [])
+            if len(bbox) != 4:
+                disease_results.append({})
+                continue
+            x1, y1, x2, y2 = bbox
+            pad_x = int((x2 - x1) * 0.1)
+            pad_y = int((y2 - y1) * 0.1)
+            crop = img[
+                max(0, y1 - pad_y):min(h, y2 + pad_y),
+                max(0, x1 - pad_x):min(w, x2 + pad_x),
+            ]
+            if crop.size == 0:
+                disease_results.append({})
+                continue
+            crop_path = os.path.join(TEMP_DIR, "outputs", f"disease_{id(det)}.jpg")
+            cv2.imwrite(crop_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            try:
+                disease_results.append(qwen.assess_disease(crop_path))
+            finally:
+                if os.path.exists(crop_path):
+                    os.unlink(crop_path)
 
     annotated_path = os.path.join(
         TEMP_DIR, "outputs", f"annotated_{Path(image_path).name}"
@@ -265,10 +285,10 @@ def detect_single_image(image_path, do_disease=False, do_detailed=False, do_3d=F
     else:
         shutil.copy2(image_path, annotated_path)
 
-    return annotated_path, detections, rgb_analyses, qwen_analyses, disease_result, det_time, mono_time
+    return annotated_path, detections, rgb_analyses, qwen_analyses, disease_results, det_time, mono_time
 
 
-def build_results_text(detections, rgb_analyses, qwen_analyses, disease_result, det_time, lang="en", mono_time=0):
+def build_results_text(detections, rgb_analyses, qwen_analyses, disease_results, det_time, lang="en", mono_time=0):
     lines = []
     lines.append(f"### {t('detection_results', lang)}")
     timing = f"YOLO11: {det_time * 1000:.1f}ms"
@@ -324,16 +344,18 @@ def build_results_text(detections, rgb_analyses, qwen_analyses, disease_result, 
                 f"- {t('qwen_label', lang)}: {qa.get('ripeness_stage', '?')} "
                 f"({qa.get('ripeness_percentage', '?')}%) — {qa.get('notes', '')}"
             )
-        lines.append("")
 
-    if disease_result:
-        lines.append(f"**{t('disease_title', lang)}**")
-        health = disease_result.get("overall_plant_health", "unknown")
-        lines.append(f"{t('health_label', lang)}: {health}")
-        for d in disease_result.get("diseases_detected", []):
-            lines.append(f"- {d.get('disease')}: {d.get('severity')} ({d.get('location')})")
-        if not disease_result.get("diseases_detected"):
-            lines.append(t("no_disease", lang))
+        if i < len(disease_results) and disease_results[i]:
+            dr = disease_results[i]
+            health = dr.get("overall_plant_health", "assessment_failed")
+            health_display = "⚠ Assessment failed" if health == "assessment_failed" else health
+            lines.append(f"- {t('health_label', lang)}: {health_display}")
+            for d in dr.get("diseases_detected", []):
+                lines.append(f"  - {d.get('disease')}: {d.get('severity')} ({d.get('location')})")
+            if not dr.get("diseases_detected") and health != "assessment_failed":
+                lines.append(f"  - {t('no_disease', lang)}")
+
+        lines.append("")
 
     return "\n".join(lines)
 

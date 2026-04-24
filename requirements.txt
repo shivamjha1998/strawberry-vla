@@ -1,5 +1,5 @@
-# MLX-VLM (Qwen 2.5 VL on Apple Silicon)
-mlx-vlm
+# OpenAI-compatible client (connects to vLLM serving Qwen3.6-35B-A3B)
+openai
 
 # YOLO (object detection)
 ultralytics
